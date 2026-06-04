@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Usage Uploader V2"
+  short_description: "Upload Codex usage with token de-duplication."
+  default_prompt: "Use $codex-usage-uploader-v2 to upload sanitized Codex usage metadata with token snapshot de-duplication."
