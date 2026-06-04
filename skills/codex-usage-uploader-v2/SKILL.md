@@ -7,7 +7,7 @@ description: Upload sanitized Codex Desktop or CLI usage metadata to a configure
 
 ## Overview
 
-Use this skill to collect local Codex session JSONL usage metadata and upload it to a dashboard ingest API. V2 keeps the original privacy boundary and adds a strict token snapshot de-duplication contract so dashboards can safely sum uploaded `token` fields without counting cumulative Codex snapshots twice.
+Use this skill to collect local Codex session JSONL usage metadata and upload it to a dashboard ingest API. V2 keeps the original privacy boundary and adds a strict token snapshot de-duplication contract so dashboards can safely sum uploaded `token` fields without counting cumulative Codex snapshots twice, including snapshots copied into forked threads or subagent fork histories.
 
 ## Quick Start
 
@@ -61,7 +61,8 @@ Token counting contract:
 - Codex `token_count` log entries can include both `last_token_usage` and `total_token_usage`.
 - `total_token_usage` is cumulative within the session and must not be summed across log entries.
 - Codex can re-emit `token_count` when rate-limit state changes, sometimes with the same token usage snapshot.
-- The uploader sends `token` from `last_token_usage` only for the first observed `total_token_usage` snapshot; repeated snapshots are skipped so dashboards can sum uploaded `token` fields as per-call increments.
+- Codex fork/subagent fork histories can copy prior `token_count` events into a new thread file; those copied ancestor snapshots must not be counted as new usage.
+- The uploader sends `token` from `last_token_usage` only for non-duplicate `total_token_usage` snapshots. It skips repeated same-file snapshots and snapshots already observed in `forked_from_id` / `parent_thread_id` ancestors, so dashboards can sum uploaded `token` fields as per-call increments.
 
 ## API Reference
 
@@ -72,5 +73,5 @@ Read `references/ingest_api.md` when implementing or validating the server-side 
 - Missing endpoint: set `CODEX_USAGE_INGEST_URL` or pass `--endpoint`.
 - Missing source: set `CODEX_USAGE_SOURCE_NAME` or pass `--source-name`.
 - Missing token: set `CODEX_USAGE_BEARER_TOKEN` or pass `--token`; `--dry-run` does not require a token.
-- Duplicate data: expected during file moves or re-scans; de-duplicate by `event_id`. Token usage snapshots are also filtered client-side when Codex re-emits the same cumulative usage with new rate-limit metadata.
+- Duplicate data: expected during file moves or re-scans; de-duplicate by `event_id`. Token usage snapshots are also filtered client-side when Codex re-emits the same cumulative usage with new rate-limit metadata or copies parent history into forked threads/subagents.
 - No events found: verify `$CODEX_HOME\sessions` or `$CODEX_HOME\archived_sessions` contains JSONL logs.

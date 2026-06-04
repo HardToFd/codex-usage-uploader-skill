@@ -30,7 +30,7 @@ except ModuleNotFoundError:
             raise RuntimeError("Python 3.9+ or backports.zoneinfo is required for this timezone.")
 
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 DEFAULT_BATCH_SIZE = 500
 SESSION_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
 TOKEN_KEYS = (
@@ -93,6 +93,13 @@ def machine_id(codex_home):
 def session_id_from_path(path):
     match = SESSION_ID_RE.search(path.name)
     return match.group(1).lower() if match else path.stem
+
+
+def normalize_session_id(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value.lower() if value else None
 
 
 def event_type(obj):
@@ -423,6 +430,101 @@ def token_total_fingerprint(payload):
     return token_usage_fingerprint(info.get("total_token_usage"))
 
 
+def source_parent_thread_id(payload):
+    source = payload.get("source")
+    if not isinstance(source, dict):
+        return None
+    subagent = source.get("subagent")
+    if not isinstance(subagent, dict):
+        return None
+    thread_spawn = subagent.get("thread_spawn")
+    if not isinstance(thread_spawn, dict):
+        return None
+    return thread_spawn.get("parent_thread_id")
+
+
+def session_parent_ids(payload):
+    parents = set()
+    for key in ("forked_from_id", "parent_thread_id"):
+        parent = normalize_session_id(payload.get(key))
+        if parent:
+            parents.add(parent)
+    source_parent = normalize_session_id(source_parent_thread_id(payload))
+    if source_parent:
+        parents.add(source_parent)
+    return parents
+
+
+def build_session_lineage_index(codex_home):
+    sessions = {}
+    files = {}
+    for path in iter_jsonl_files(codex_home):
+        path_session_id = normalize_session_id(session_id_from_path(path))
+        current_session_id = path_session_id
+        parent_ids = set()
+        token_fingerprints = set()
+        saw_current_meta = False
+        try:
+            handle = path.open("rb")
+        except OSError:
+            continue
+        with handle:
+            for raw_line in handle:
+                try:
+                    obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+                if event_type(obj) == "session_meta" and not saw_current_meta:
+                    meta_session_id = normalize_session_id(payload.get("id"))
+                    if meta_session_id:
+                        current_session_id = meta_session_id
+                    parent_ids.update(session_parent_ids(payload))
+                    saw_current_meta = True
+                fingerprint = token_total_fingerprint(payload)
+                if fingerprint is not None:
+                    token_fingerprints.add(fingerprint)
+        if not current_session_id:
+            continue
+        files[str(path)] = current_session_id
+        entry = sessions.setdefault(current_session_id, {
+            "parents": set(),
+            "token_total_fingerprints": set(),
+        })
+        entry["parents"].update(parent_ids)
+        entry["token_total_fingerprints"].update(token_fingerprints)
+    return {"sessions": sessions, "files": files}
+
+
+def session_id_for_path(path, lineage_index):
+    if isinstance(lineage_index, dict):
+        files = lineage_index.get("files") if isinstance(lineage_index.get("files"), dict) else {}
+        session_id = normalize_session_id(files.get(str(path)))
+        if session_id:
+            return session_id
+    return normalize_session_id(session_id_from_path(path))
+
+
+def inherited_token_total_fingerprints(session_id, lineage_index):
+    if not session_id or not isinstance(lineage_index, dict):
+        return set()
+    sessions = lineage_index.get("sessions") if isinstance(lineage_index.get("sessions"), dict) else {}
+    inherited = set()
+    visited = set()
+    stack = list(sessions.get(session_id, {}).get("parents", set()))
+    while stack:
+        parent_id = normalize_session_id(stack.pop())
+        if not parent_id or parent_id in visited:
+            continue
+        visited.add(parent_id)
+        parent = sessions.get(parent_id)
+        if not isinstance(parent, dict):
+            continue
+        inherited.update(parent.get("token_total_fingerprints", set()))
+        stack.extend(parent.get("parents", set()))
+    return inherited
+
+
 def build_event(obj, path, line_no, context, source_name, mid):
     payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
     event_type_name = event_type(obj)
@@ -566,7 +668,7 @@ def reconstruct_last_token_total_fingerprint(path, offset):
     return last_fingerprint
 
 
-def read_file_events(path, record, tz, since_dt, source_name, mid):
+def read_file_events(path, record, tz, since_dt, source_name, mid, inherited_token_fingerprints=None):
     record = record if isinstance(record, dict) else {}
     stat = path.stat()
     offset = int(record.get("offset") or 0)
@@ -585,6 +687,7 @@ def read_file_events(path, record, tz, since_dt, source_name, mid):
     elif offset and last_token_total_fingerprint is None:
         last_token_total_fingerprint = reconstruct_last_token_total_fingerprint(path, offset)
 
+    inherited_token_fingerprints = inherited_token_fingerprints or set()
     events = []
     last_timestamp = record.get("last_timestamp")
     current_offset = offset
@@ -608,8 +711,10 @@ def read_file_events(path, record, tz, since_dt, source_name, mid):
                 last_timestamp = timestamp
             token_fingerprint = token_total_fingerprint(payload)
             is_repeated_token_snapshot = False
+            is_inherited_token_snapshot = False
             if token_fingerprint is not None:
                 is_repeated_token_snapshot = token_fingerprint == last_token_total_fingerprint
+                is_inherited_token_snapshot = token_fingerprint in inherited_token_fingerprints
                 last_token_total_fingerprint = token_fingerprint
             if since_dt and timestamp:
                 try:
@@ -617,7 +722,7 @@ def read_file_events(path, record, tz, since_dt, source_name, mid):
                         continue
                 except ValueError:
                     continue
-            if is_repeated_token_snapshot:
+            if is_repeated_token_snapshot or is_inherited_token_snapshot:
                 continue
             event = build_event(obj, path, line_no, context, source_name, mid)
             if event:
@@ -638,12 +743,15 @@ def collect_events(codex_home, state, tz, since_dt, source_name, mid):
     next_state = copy.deepcopy(state or {"version": 1, "files": {}})
     next_state.setdefault("version", 1)
     next_state.setdefault("files", {})
+    lineage_index = build_session_lineage_index(codex_home)
     all_events = []
     seen_ids = set()
     files_scanned = 0
     for path in iter_jsonl_files(codex_home):
         files_scanned += 1
         key = str(path)
+        session_id = session_id_for_path(path, lineage_index)
+        inherited_fingerprints = inherited_token_total_fingerprints(session_id, lineage_index)
         file_events, next_record = read_file_events(
             path,
             next_state["files"].get(key, {}),
@@ -651,6 +759,7 @@ def collect_events(codex_home, state, tz, since_dt, source_name, mid):
             since_dt,
             source_name,
             mid,
+            inherited_fingerprints,
         )
         next_state["files"][key] = next_record
         for event in file_events:
