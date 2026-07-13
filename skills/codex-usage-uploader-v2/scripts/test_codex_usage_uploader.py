@@ -208,6 +208,14 @@ def collect_once(codex_home, state=None):
 
 def test_collects_token_and_metadata_without_private_content():
     module = load_module()
+    system_zoneinfo = module._ZoneInfo
+    try:
+        def unavailable_timezone(name):
+            raise module.ZoneInfoNotFoundError(name)
+        module._ZoneInfo = unavailable_timezone
+        assert module.ZoneInfo("Asia/Shanghai").utcoffset(None).total_seconds() == 8 * 3600
+    finally:
+        module._ZoneInfo = system_zoneinfo
     assert module.sanitize_repository_url(
         "git@git.example.com:team/repo.git?token=LEAK#fragment"
     ) == "git.example.com:team/repo.git"

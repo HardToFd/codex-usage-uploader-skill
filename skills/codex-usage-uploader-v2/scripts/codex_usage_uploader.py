@@ -16,19 +16,28 @@ import urllib.request
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 
 try:
-    from zoneinfo import ZoneInfo
+    from zoneinfo import ZoneInfo as _ZoneInfo, ZoneInfoNotFoundError
 except ModuleNotFoundError:
     try:
-        from backports.zoneinfo import ZoneInfo
+        from backports.zoneinfo import ZoneInfo as _ZoneInfo, ZoneInfoNotFoundError
     except ModuleNotFoundError:
-        def ZoneInfo(name):
-            fixed_offsets = {
-                "UTC": timezone.utc,
-                "Asia/Shanghai": timezone(timedelta(hours=8), name),
-            }
-            if name in fixed_offsets:
-                return fixed_offsets[name]
-            raise RuntimeError("Python 3.9+ or backports.zoneinfo is required for this timezone.")
+        _ZoneInfo = None
+        ZoneInfoNotFoundError = KeyError
+
+
+def ZoneInfo(name):
+    fixed_offsets = {
+        "UTC": timezone.utc,
+        "Asia/Shanghai": timezone(timedelta(hours=8), name),
+    }
+    if _ZoneInfo is not None:
+        try:
+            return _ZoneInfo(name)
+        except ZoneInfoNotFoundError:
+            pass
+    if name in fixed_offsets:
+        return fixed_offsets[name]
+    raise RuntimeError("Timezone data is unavailable; install tzdata for this timezone.")
 
 
 VERSION = "2.1.0"
