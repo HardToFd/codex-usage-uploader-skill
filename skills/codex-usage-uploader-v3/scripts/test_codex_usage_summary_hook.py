@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 
 import codex_usage_summary_hook as hook
 
@@ -43,7 +44,7 @@ class SummaryHookTest(unittest.TestCase):
         )
 
     def rows(self):
-        with sqlite3.connect(self.queue) as connection:
+        with closing(sqlite3.connect(self.queue)) as connection:
             connection.row_factory = sqlite3.Row
             return [dict(row) for row in connection.execute("SELECT * FROM turn_summary_queue ORDER BY rowid")]
 
@@ -202,7 +203,7 @@ class SummaryHookTest(unittest.TestCase):
             row["work_item_ref"], row["match_method"], row["match_state"],
         ))
 
-        with sqlite3.connect(self.queue) as connection:
+        with closing(sqlite3.connect(self.queue)) as connection:
             dump = "\n".join(connection.iterdump())
             columns = {row[1] for row in connection.execute("PRAGMA table_info(turn_summary_queue)")}
         self.assertNotIn("prompt", columns)
