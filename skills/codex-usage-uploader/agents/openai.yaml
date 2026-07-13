@@ -1,4 +1,0 @@
-interface:
-  display_name: "Codex Usage Uploader"
-  short_description: "Upload sanitized Codex usage metadata."
-  default_prompt: "Use $codex-usage-uploader to configure and run Codex usage collection."

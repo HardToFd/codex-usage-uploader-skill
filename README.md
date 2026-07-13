@@ -1,36 +1,35 @@
-# Codex Usage Uploader Skill
+# Codex Usage Uploader Skills
 
-Codex skill for uploading sanitized local Codex Desktop or CLI usage metadata to an ingest API. It scans local Codex JSONL session logs incrementally, filters private content, sends metadata batches with Bearer authentication, and stores local progress state.
+Upload sanitized local Codex Desktop or CLI usage metadata to one ingest API. The uploaders scan Codex JSONL logs incrementally and keep local progress state. V2 is metadata-only; V3 can additionally upload opt-in, locally redacted and truncated turn summaries.
 
-This repository contains two skill paths:
+## Versions
 
-- `skills/codex-usage-uploader`: original uploader.
-- `skills/codex-usage-uploader-v2`: V2 uploader with token snapshot de-duplication. Use this when dashboards sum uploaded token fields and must avoid over-counting Codex cumulative `total_token_usage` or re-emitted `token_count` snapshots.
+- `skills/codex-usage-uploader-v2`: exact per-call token accounting with cumulative snapshot, re-emission, fork, and subagent de-duplication.
+- `skills/codex-usage-uploader-v3`: the V2.1 accounting contract plus optional local Hook turn summaries and `work_item_ref` attribution. Summary upload is off by default.
 
 ## Install
 
-Install with Codex's built-in skill installer:
+Install V3 from the repository's default `main` branch:
 
 ```powershell
 python C:\Users\<user>\.codex\skills\.system\skill-installer\scripts\install-skill-from-github.py `
   --repo HardToFd/codex-usage-uploader-skill `
-  --path skills/codex-usage-uploader
+  --path skills/codex-usage-uploader-v3
+```
+
+Install V2 when turn attribution is not needed:
+
+```powershell
+python C:\Users\<user>\.codex\skills\.system\skill-installer\scripts\install-skill-from-github.py `
+  --repo HardToFd/codex-usage-uploader-skill `
+  --path skills/codex-usage-uploader-v2
 ```
 
 Restart Codex after installation so the skill is discovered.
 
-Install the V2 skill:
-
-```powershell
-python C:\Users\<user>\.codex\skills\.system\skill-installer\scripts\install-skill-from-github.py `
-  --repo HardToFd/codex-usage-uploader-skill `
-  --path skills/codex-usage-uploader-v2 `
-  --branch develop
-```
-
 ## Configure
 
-The uploader needs three values:
+Both versions use the same three values:
 
 ```powershell
 $env:CODEX_USAGE_INGEST_URL = "https://collector.example.com/api/codex/usage"
@@ -38,40 +37,28 @@ $env:CODEX_USAGE_SOURCE_NAME = "alice"
 $env:CODEX_USAGE_BEARER_TOKEN = "<bearer-token>"
 ```
 
-Run a dry-run first:
+Run a dry-run before uploading:
 
 ```powershell
-python C:\Users\<user>\.codex\skills\codex-usage-uploader\scripts\codex_usage_uploader.py --dry-run
+python C:\Users\<user>\.codex\skills\codex-usage-uploader-v3\scripts\codex_usage_uploader.py `
+  --source-name alice --summary-mode local --dry-run
 ```
 
-For V2, use the V2 skill directory:
+V3 uploads usage only unless summary upload is explicitly enabled:
 
 ```powershell
-python C:\Users\<user>\.codex\skills\codex-usage-uploader-v2\scripts\codex_usage_uploader.py --dry-run
+$env:CODEX_USAGE_SUMMARY_MODE = "local"
+$env:CODEX_USAGE_SUMMARY_HMAC_KEY = "<persistent-high-entropy-secret>"
+python C:\Users\<user>\.codex\skills\codex-usage-uploader-v3\scripts\codex_usage_uploader.py
 ```
 
-Then run the upload:
-
-```powershell
-python C:\Users\<user>\.codex\skills\codex-usage-uploader\scripts\codex_usage_uploader.py
-```
-
-For a first historical backfill with many events, use larger batches and longer timeouts:
-
-```powershell
-python C:\Users\<user>\.codex\skills\codex-usage-uploader\scripts\codex_usage_uploader.py `
-  --batch-size 1000 `
-  --timeout 60 `
-  --retries 2
-```
+Configure and trust the optional local Hook before sending the first requirement link; see [the V3 skill guide](skills/codex-usage-uploader-v3/SKILL.md). Put the same single requirement link in the first prompt of every independent Codex task that belongs to it. Later turns in one task inherit locally, but unlinked tasks are not guessed semantically. If one running turn changes requirements, V3 marks that turn ambiguous instead of guessing how to split it. The Hook writes redacted structured summaries to local SQLite; the uploader sends them to the same endpoint in a batch separate from usage events.
 
 ## Privacy
 
-The uploader does not send raw user messages, assistant replies, reasoning content, shell stdout or stderr, full shell commands, tool output, API argument values, or unified diffs. It sends counts, IDs, timestamps, status, durations, token fields, rate-limit metadata, selected cwd/model/git context, command program summaries, and patch change-type statistics.
+V2 does not upload conversation or tool content. Normal metadata does include local `cwd`/`codex_home`, session/model identifiers, and a credential-stripped Git remote. V3 summary mode additionally uploads the allowlisted `turn_summary` structure derived from the prompt and final assistant message. Redaction covers common URLs, paths, email/IP addresses, identifiers, credentials, and opaque secrets, but it cannot identify every business-sensitive fact. Review the complete `--summary-mode local --dry-run` summary list and attribution preview; production V3 uploads require HTTPS.
 
-## Server Contract
+## Server Contracts
 
-See [skills/codex-usage-uploader/references/ingest_api.md](skills/codex-usage-uploader/references/ingest_api.md).
-
-For V2 token snapshot de-duplication semantics, see [skills/codex-usage-uploader-v2/references/ingest_api.md](skills/codex-usage-uploader-v2/references/ingest_api.md).
-
+- [V2 ingest contract](skills/codex-usage-uploader-v2/references/ingest_api.md)
+- [V3 ingest and turn-summary contract](skills/codex-usage-uploader-v3/references/ingest_api.md)

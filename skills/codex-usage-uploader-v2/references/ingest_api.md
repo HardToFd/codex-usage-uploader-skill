@@ -18,7 +18,7 @@ Content-Type: application/json
   "source_name": "alice",
   "machine_id": "stable-hash",
   "codex_home": "C:\\Users\\alice\\.codex",
-  "collector_version": "2.0.0",
+  "collector_version": "2.1.0",
   "collected_at": "2026-05-06T12:00:00+08:00",
   "timezone": "Asia/Shanghai",
   "batch_id": "uuid",
@@ -54,7 +54,7 @@ Optional event sections:
 
 ## Privacy Contract
 
-Clients must not send raw user messages, agent messages, reasoning content, shell stdout/stderr, full shell commands, tool output, API arguments with values, or unified diffs.
+Clients must not send raw user messages, agent messages, reasoning content, shell stdout/stderr, full shell commands, tool output, API arguments with values, or unified diffs. Normal metadata includes raw local cwd/codex-home paths and a Git remote with userinfo/query/fragment removed, so use a trusted HTTPS endpoint.
 
 ## Response Body
 
@@ -70,4 +70,4 @@ The server should return JSON:
 
 The server must de-duplicate by `event_id`. A repeated `event_id` from the same source should not increment usage totals twice.
 
-For token dashboards, sum only the uploaded `token` fields. Do not ingest or sum Codex log `total_token_usage`; it is cumulative within a session. Codex can also re-emit a `token_count` event when only rate-limit state changes, so clients filter repeated cumulative token snapshots before upload.
+For token dashboards, sum only the uploaded `token` fields. Do not ingest or sum Codex log `total_token_usage`; it is cumulative within a session. Codex can also re-emit a `token_count` event when only rate-limit state changes and can copy prior `token_count` events into forked thread or subagent histories, so clients filter repeated and inherited cumulative token snapshots before upload.

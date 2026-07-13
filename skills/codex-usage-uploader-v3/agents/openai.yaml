@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Usage Uploader V3"
+  short_description: "Upload exact usage with opt-in turn attribution."
+  default_prompt: "Use $codex-usage-uploader-v3 to upload sanitized Codex usage with exact token de-duplication and optional local turn attribution."

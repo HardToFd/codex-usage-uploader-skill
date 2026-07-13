@@ -2,17 +2,21 @@
 import argparse
 import copy
 import hashlib
+import ipaddress
 import json
 import os
 import pathlib
 import re
 import socket
+import sqlite3
 import sys
 import time
+import unicodedata
 import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import closing
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 
 try:
@@ -31,9 +35,69 @@ except ModuleNotFoundError:
             raise RuntimeError("Python 3.9+ or backports.zoneinfo is required for this timezone.")
 
 
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 DEFAULT_BATCH_SIZE = 500
+DEFAULT_SUMMARY_QUEUE = pathlib.Path.home() / ".codex" / "codex_usage_summary_queue.sqlite3"
+SUMMARY_TASK_FIELDS = (
+    "title",
+    "summary",
+    "work_item_ref",
+    "match_method",
+    "match_state",
+    "drift_state",
+    "outcome",
+    "summary_schema_version",
+    "redaction_version",
+)
+SUMMARY_MATCH_METHODS = {"explicit_link", "inherited", "none", "multiple_links"}
+SUMMARY_MATCH_STATES = {"assigned", "unassigned", "ambiguous"}
+SUMMARY_DRIFT_STATES = {"not_evaluated", "stable", "changed"}
+SUMMARY_OUTCOMES = {"in_progress", "turn_complete", "turn_aborted"}
+WORK_ITEM_REF_RE = re.compile(r"hmac:[0-9a-f]{64}")
+SUMMARY_ID_RE = re.compile(r"[0-9a-f]{64}")
+SUMMARY_FORBIDDEN_PATTERNS = (
+    re.compile(r"\b(?:https?|ftp)://[^\s<>{}\[\]\"']+|\bwww\.[^\s<>{}\[\]\"']+", re.IGNORECASE),
+    re.compile(
+        r"\b(?:authorization|proxy-authorization|(?:[A-Za-z0-9_.-]*[-_.])?(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token|secret|password|passwd))\b[\"']?\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^}]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?<!\w)--(?:api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|password|passwd)\s+(?:\"[^\"]*\"|'[^']*'|\S+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token|secret|password|passwd)\b\s+is\s+(?:\"[^\"]*\"|'[^']*'|\S+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:pwd|aws[-_]?access[-_]?key[-_]?id|aws[-_]?secret[-_]?access[-_]?key)\b\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^}]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:\u5bc6\u7801|\u53e3\u4ee4|\u5bc6\u94a5|\u8bbf\u95ee\u4ee4\u724c|\u5237\u65b0\u4ee4\u724c|\u4ee4\u724c|\u51ed\u636e)\s*(?::|=|\u662f)\s*(?:\"[^\"]*\"|'[^']*'|[^}]+)"
+    ),
+    re.compile(r"\b(?:cookie|set-cookie)\b\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^}]+)", re.IGNORECASE),
+    re.compile(r'"(?:[a-z]:[\\/]|\\\\[^\\/\s]+[\\/]|/)[^\"]*"', re.IGNORECASE),
+    re.compile(r"'(?:[a-z]:[\\/]|\\\\[^\\/\s]+[\\/]|/)[^']*'", re.IGNORECASE),
+    re.compile(r"(?<![\w$])(?:\$[A-Za-z_][A-Za-z0-9_]*|~)[\\/][^<>{}\[\]\"']*"),
+    re.compile(r"(?<![\w./\\$])(?:[\w.-]+[\\/])+[\w.-]+\.[A-Za-z0-9]{1,12}\b"),
+    re.compile(r"(?<![\w./\\$])(?:[\w.-]+[\\/]){2,}[\w.-]+\b"),
+    re.compile(r"(?<![\w])(?:[a-z]:[\\/]|\\\\[^\\/\s]+[\\/])[^<>{}\[\]\"']*", re.IGNORECASE),
+    re.compile(r"(?<![\w:])/(?:[^<>{}\[\]\"']*)"),
+    re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE),
+    re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])"),
+    re.compile(r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])"),
+    re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE),
+    re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
+    re.compile(r"\bbasic\s+[A-Za-z0-9+/=]{8,}", re.IGNORECASE),
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    re.compile(r"\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\b(?:sk|rk|pk|gh[pousr]|xox[baprs])[-_][A-Za-z0-9_-]{12,}\b", re.IGNORECASE),
+    re.compile(r"\b[0-9a-f]{32,}\b", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{32,}={0,2}(?![A-Za-z0-9+/=_-])"),
+)
 SESSION_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
+SUMMARY_SAFE_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
 TOKEN_KEYS = (
     "input_tokens",
     "cached_input_tokens",
@@ -51,6 +115,26 @@ CONTENT_EVENT_TYPES = {
 }
 
 
+def trusted_endpoint(value):
+    try:
+        parts = urllib.parse.urlsplit(value)
+    except (TypeError, ValueError):
+        return False
+    if not parts.hostname or parts.username or parts.password:
+        return False
+    if parts.scheme.lower() == "https":
+        return True
+    if parts.scheme.lower() != "http":
+        return False
+    host = parts.hostname.rstrip(".").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Upload sanitized Codex usage metadata.")
     parser.add_argument("--endpoint", default=os.environ.get("CODEX_USAGE_INGEST_URL"))
@@ -59,6 +143,15 @@ def parse_args():
     parser.add_argument("--codex-home", default=os.environ.get("CODEX_HOME") or str(pathlib.Path.home() / ".codex"))
     parser.add_argument("--timezone", default=os.environ.get("CODEX_USAGE_TIMEZONE") or "Asia/Shanghai")
     parser.add_argument("--state-file", default=None)
+    parser.add_argument(
+        "--summary-mode",
+        choices=("off", "local"),
+        default=os.environ.get("CODEX_USAGE_SUMMARY_MODE") or "off",
+    )
+    parser.add_argument(
+        "--summary-queue",
+        default=os.environ.get("CODEX_USAGE_SUMMARY_QUEUE") or str(DEFAULT_SUMMARY_QUEUE),
+    )
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--since", default=None, help="Only emit events at or after this local date/time.")
@@ -67,8 +160,10 @@ def parse_args():
     parser.add_argument("--retry-delay", type=float, default=1.0)
     args = parser.parse_args()
 
-    if not args.endpoint:
+    if not args.endpoint and not args.dry_run:
         parser.error("--endpoint or CODEX_USAGE_INGEST_URL is required")
+    if args.endpoint and not args.dry_run and not trusted_endpoint(args.endpoint):
+        parser.error("--endpoint must use HTTPS (loopback HTTP is allowed for local testing)")
     if not args.source_name:
         parser.error("--source-name or CODEX_USAGE_SOURCE_NAME is required")
     if not args.dry_run and not args.token:
@@ -351,6 +446,9 @@ def update_context(context, event_type_name, payload):
         for key in ("cwd", "originator", "cli_version", "model_provider", "forked_from_id", "memory_mode"):
             if payload.get(key) is not None:
                 next_context[key] = payload.get(key)
+        parent_thread_id = payload.get("parent_thread_id") or source_parent_thread_id(payload)
+        if parent_thread_id:
+            next_context["parent_thread_id"] = parent_thread_id
         git = payload.get("git")
         if isinstance(git, dict):
             next_context["git"] = clean({
@@ -398,6 +496,7 @@ def public_context(context):
         "cli_version",
         "model_provider",
         "forked_from_id",
+        "parent_thread_id",
         "memory_mode",
         "git",
         "turn_id",
@@ -457,6 +556,24 @@ def token_total_fingerprint(payload):
     return token_usage_fingerprint(info.get("total_token_usage"))
 
 
+def terminal_task_fingerprint(payload):
+    if not isinstance(payload, dict) or payload.get("type") not in {"task_complete", "turn_aborted"}:
+        return None
+    turn_id = payload.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+    identity = {
+        "type": payload.get("type"),
+        "turn_id": turn_id,
+        "completed_at": payload.get("completed_at"),
+        "duration_ms": payload.get("duration_ms"),
+        "time_to_first_token_ms": payload.get("time_to_first_token_ms"),
+        "reason": payload.get("reason"),
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def source_parent_thread_id(payload):
     source = payload.get("source")
     if not isinstance(source, dict):
@@ -490,6 +607,7 @@ def build_session_lineage_index(codex_home):
         current_session_id = path_session_id
         parent_ids = set()
         token_fingerprints = set()
+        terminal_task_fingerprints = set()
         saw_current_meta = False
         try:
             handle = path.open("rb")
@@ -511,15 +629,20 @@ def build_session_lineage_index(codex_home):
                 fingerprint = token_total_fingerprint(payload)
                 if fingerprint is not None:
                     token_fingerprints.add(fingerprint)
+                task_fingerprint = terminal_task_fingerprint(payload)
+                if task_fingerprint is not None:
+                    terminal_task_fingerprints.add(task_fingerprint)
         if not current_session_id:
             continue
         files[str(path)] = current_session_id
         entry = sessions.setdefault(current_session_id, {
             "parents": set(),
             "token_total_fingerprints": set(),
+            "terminal_task_fingerprints": set(),
         })
         entry["parents"].update(parent_ids)
         entry["token_total_fingerprints"].update(token_fingerprints)
+        entry["terminal_task_fingerprints"].update(terminal_task_fingerprints)
     return {"sessions": sessions, "files": files}
 
 
@@ -533,6 +656,14 @@ def session_id_for_path(path, lineage_index):
 
 
 def inherited_token_total_fingerprints(session_id, lineage_index):
+    return inherited_fingerprints(session_id, lineage_index, "token_total_fingerprints")
+
+
+def inherited_terminal_task_fingerprints(session_id, lineage_index):
+    return inherited_fingerprints(session_id, lineage_index, "terminal_task_fingerprints")
+
+
+def inherited_fingerprints(session_id, lineage_index, field):
     if not session_id or not isinstance(lineage_index, dict):
         return set()
     sessions = lineage_index.get("sessions") if isinstance(lineage_index.get("sessions"), dict) else {}
@@ -547,7 +678,7 @@ def inherited_token_total_fingerprints(session_id, lineage_index):
         parent = sessions.get(parent_id)
         if not isinstance(parent, dict):
             continue
-        inherited.update(parent.get("token_total_fingerprints", set()))
+        inherited.update(parent.get(field, set()))
         stack.extend(parent.get("parents", set()))
     return inherited
 
@@ -587,6 +718,7 @@ def build_event(obj, path, line_no, context, source_name, mid):
             "cli_version": payload.get("cli_version"),
             "model_provider": payload.get("model_provider"),
             "forked_from_id": payload.get("forked_from_id"),
+            "parent_thread_id": payload.get("parent_thread_id") or source_parent_thread_id(payload),
             "memory_mode": payload.get("memory_mode"),
         })
     elif event_type_name in {"turn_context", "thread_name_updated"}:
@@ -695,7 +827,16 @@ def reconstruct_last_token_total_fingerprint(path, offset):
     return last_fingerprint
 
 
-def read_file_events(path, record, tz, since_dt, source_name, mid, inherited_token_fingerprints=None):
+def read_file_events(
+    path,
+    record,
+    tz,
+    since_dt,
+    source_name,
+    mid,
+    inherited_token_fingerprints=None,
+    inherited_task_fingerprints=None,
+):
     record = record if isinstance(record, dict) else {}
     stat = path.stat()
     offset = int(record.get("offset") or 0)
@@ -715,6 +856,7 @@ def read_file_events(path, record, tz, since_dt, source_name, mid, inherited_tok
         last_token_total_fingerprint = reconstruct_last_token_total_fingerprint(path, offset)
 
     inherited_token_fingerprints = inherited_token_fingerprints or set()
+    inherited_task_fingerprints = inherited_task_fingerprints or set()
     events = []
     last_timestamp = record.get("last_timestamp")
     current_offset = offset
@@ -737,6 +879,7 @@ def read_file_events(path, record, tz, since_dt, source_name, mid, inherited_tok
             if timestamp:
                 last_timestamp = timestamp
             token_fingerprint = token_total_fingerprint(payload)
+            task_fingerprint = terminal_task_fingerprint(payload)
             is_repeated_token_snapshot = False
             is_inherited_token_snapshot = False
             if token_fingerprint is not None:
@@ -749,7 +892,11 @@ def read_file_events(path, record, tz, since_dt, source_name, mid, inherited_tok
                         continue
                 except ValueError:
                     continue
-            if is_repeated_token_snapshot or is_inherited_token_snapshot:
+            if (
+                is_repeated_token_snapshot
+                or is_inherited_token_snapshot
+                or task_fingerprint in inherited_task_fingerprints
+            ):
                 continue
             event = build_event(obj, path, line_no, context, source_name, mid)
             if event:
@@ -779,6 +926,7 @@ def collect_events(codex_home, state, tz, since_dt, source_name, mid):
         key = str(path)
         session_id = session_id_for_path(path, lineage_index)
         inherited_fingerprints = inherited_token_total_fingerprints(session_id, lineage_index)
+        inherited_task_fingerprints = inherited_terminal_task_fingerprints(session_id, lineage_index)
         file_events, next_record = read_file_events(
             path,
             next_state["files"].get(key, {}),
@@ -787,6 +935,7 @@ def collect_events(codex_home, state, tz, since_dt, source_name, mid):
             source_name,
             mid,
             inherited_fingerprints,
+            inherited_task_fingerprints,
         )
         next_state["files"][key] = next_record
         for event in file_events:
@@ -798,7 +947,278 @@ def collect_events(codex_home, state, tz, since_dt, source_name, mid):
         "files_scanned": files_scanned,
         "events_collected": len(all_events),
     }
-    return all_events, next_state, stats
+    return all_events, next_state, stats, lineage_index
+
+
+def summary_event_id(summary_id):
+    return hashlib.sha256(f"turn_summary:{summary_id}".encode("utf-8")).hexdigest()
+
+
+def valid_summary_text(value, limit):
+    normalized = unicodedata.normalize("NFKC", value) if isinstance(value, str) else ""
+    return (
+        isinstance(value, str)
+        and len(value) <= limit
+        and not any(pattern.search(normalized) for pattern in SUMMARY_FORBIDDEN_PATTERNS)
+        and not any(unicodedata.category(char).startswith("C") for char in value)
+    )
+
+
+def valid_summary_timestamp(value):
+    if not isinstance(value, str) or len(value) > 64:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def validated_summary_row(row):
+    values = {key: row[key] for key in row.keys()}
+    for field in ("summary_id", "session_id", "turn_id", "timestamp", "agent_id"):
+        value = values.get(field)
+        if (
+            not isinstance(value, str)
+            or len(value) > 256
+            or (field != "agent_id" and not value.strip())
+            or any(unicodedata.category(char).startswith("C") for char in value)
+        ):
+            raise RuntimeError(f"summary queue row has invalid {field}")
+        values[field] = value.strip()
+    for field in ("summary_id", "session_id", "turn_id", "agent_id"):
+        if values[field] and not SUMMARY_SAFE_ID_RE.fullmatch(values[field]):
+            raise RuntimeError(f"summary queue row has invalid {field}")
+    if not SESSION_ID_RE.fullmatch(values["session_id"]):
+        raise RuntimeError("summary queue row has invalid session_id")
+    if not SESSION_ID_RE.fullmatch(values["turn_id"]):
+        raise RuntimeError("summary queue row has invalid turn_id")
+    if not SUMMARY_ID_RE.fullmatch(values["summary_id"]):
+        raise RuntimeError("summary queue row has invalid summary_id")
+    if not valid_summary_timestamp(values["timestamp"]):
+        raise RuntimeError("summary queue row has invalid timestamp")
+    if values["agent_id"] and not SESSION_ID_RE.fullmatch(values["agent_id"]):
+        raise RuntimeError("summary queue row has invalid agent_id")
+    if not valid_summary_text(values.get("title"), 80) or not valid_summary_text(values.get("summary"), 240):
+        raise RuntimeError("summary queue row has invalid redacted text")
+    ref = values.get("work_item_ref")
+    if not isinstance(ref, str) or (ref and not WORK_ITEM_REF_RE.fullmatch(ref)):
+        raise RuntimeError("summary queue row has invalid work_item_ref")
+    if values.get("match_method") not in SUMMARY_MATCH_METHODS:
+        raise RuntimeError("summary queue row has invalid match_method")
+    if values.get("match_state") not in SUMMARY_MATCH_STATES:
+        raise RuntimeError("summary queue row has invalid match_state")
+    if values.get("drift_state") not in SUMMARY_DRIFT_STATES:
+        raise RuntimeError("summary queue row has invalid drift_state")
+    if values.get("outcome") not in SUMMARY_OUTCOMES:
+        raise RuntimeError("summary queue row has invalid outcome")
+    if values["match_state"] == "assigned" and not ref:
+        raise RuntimeError("assigned summary queue row has no work_item_ref")
+    if values["match_state"] != "assigned" and ref:
+        raise RuntimeError("unassigned summary queue row has a work_item_ref")
+    if values["match_method"] == "multiple_links" and values["match_state"] != "ambiguous":
+        raise RuntimeError("multiple-link summary queue row is not ambiguous")
+    schema_version = values.get("summary_schema_version")
+    if isinstance(schema_version, bool) or schema_version != 1:
+        raise RuntimeError("summary queue row has invalid summary_schema_version")
+    if values.get("redaction_version") != "redact-v1":
+        raise RuntimeError("summary queue row has invalid redaction_version")
+    return values
+
+
+def event_turn_key(event):
+    if not isinstance(event, dict) or not isinstance(event.get("session_id"), str):
+        return None
+    context = event.get("context") if isinstance(event.get("context"), dict) else {}
+    task = event.get("task") if isinstance(event.get("task"), dict) else {}
+    turn_id = context.get("turn_id") or task.get("turn_id")
+    return (event["session_id"], turn_id) if isinstance(turn_id, str) and turn_id else None
+
+
+def terminal_summary_outcomes(events):
+    outcomes = {}
+    for event in events:
+        if event.get("event_type") != "turn_aborted":
+            continue
+        key = event_turn_key(event)
+        if key:
+            outcomes[key] = ("turn_aborted", event.get("timestamp"))
+    return outcomes
+
+
+def summary_parent_session(child_session_id, root_session_id, lineage_index):
+    if not child_session_id or not isinstance(lineage_index, dict):
+        return root_session_id, False
+    sessions = lineage_index.get("sessions") if isinstance(lineage_index.get("sessions"), dict) else {}
+    parents = sessions.get(child_session_id, {}).get("parents", set())
+    parents = {normalize_session_id(parent) for parent in parents}
+    parents.discard(None)
+    if not parents:
+        return root_session_id, False
+    if len(parents) == 1:
+        parent = next(iter(parents))
+        return parent, parent != normalize_session_id(root_session_id)
+    return root_session_id, True
+
+
+def read_summary_events(queue_path, terminal_outcomes=None, lineage_index=None):
+    queue_path = pathlib.Path(queue_path).expanduser()
+    if not queue_path.exists():
+        return [], []
+    terminal_outcomes = terminal_outcomes or {}
+    uri = queue_path.resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute("""
+            SELECT summary_id, session_id, turn_id, agent_id, timestamp,
+                   title, summary, work_item_ref, match_method, match_state,
+                   drift_state, outcome, summary_schema_version, redaction_version, ready
+            FROM turn_summary_queue
+            WHERE uploaded = 0
+            ORDER BY timestamp, summary_id
+        """).fetchall()
+
+    summary_ids = []
+    events = []
+    for row in rows:
+        usage_key = (row["agent_id"] or row["session_id"], row["turn_id"])
+        terminal = terminal_outcomes.get(usage_key)
+        if not row["ready"] and not terminal:
+            continue
+        values = validated_summary_row(row)
+        if terminal:
+            values["outcome"] = terminal[0]
+            if isinstance(terminal[1], str) and terminal[1]:
+                values["timestamp"] = terminal[1]
+        summary_id = values["summary_id"]
+        summary_ids.append(summary_id)
+        child_session_id = values["agent_id"]
+        context = {"turn_id": values["turn_id"]}
+        if child_session_id:
+            parent_session_id, nested_or_ambiguous = summary_parent_session(
+                child_session_id,
+                values["session_id"],
+                lineage_index,
+            )
+            context["parent_session_id"] = parent_session_id
+            if nested_or_ambiguous:
+                # Hook input exposes the root lineage but not the immediate
+                # spawning agent. Never attribute a nested child to a newer
+                # root requirement merely because it was latest at spawn time.
+                values.update(
+                    work_item_ref="",
+                    match_method="none",
+                    match_state="unassigned",
+                    drift_state="not_evaluated",
+                )
+        events.append(clean({
+            "event_id": summary_event_id(summary_id),
+            "session_id": child_session_id or values["session_id"],
+            "timestamp": values["timestamp"],
+            "event_type": "turn_summary",
+            "line_no": 0,
+            "accuracy": "summary_local",
+            "context": context,
+            "task": {field: values[field] for field in SUMMARY_TASK_FIELDS},
+        }))
+    return events, summary_ids
+
+
+def finalize_terminal_summaries(queue_path, terminal_outcomes):
+    if not terminal_outcomes:
+        return 0
+    queue_path = pathlib.Path(queue_path).expanduser()
+    if not queue_path.exists():
+        return 0
+    updated = 0
+    with closing(sqlite3.connect(str(queue_path))) as connection:
+        for (usage_session_id, turn_id), (outcome, timestamp) in terminal_outcomes.items():
+            cursor = connection.execute(
+                """UPDATE turn_summary_queue
+                   SET outcome = ?,
+                       timestamp = COALESCE(?, timestamp),
+                       ready = 1,
+                       updated_at = COALESCE(?, updated_at)
+                   WHERE turn_id = ? AND ready = 0 AND uploaded = 0
+                     AND ((agent_id = '' AND session_id = ?) OR agent_id = ?)""",
+                (outcome, timestamp, timestamp, turn_id, usage_session_id, usage_session_id),
+            )
+            updated += cursor.rowcount
+        connection.commit()
+    return updated
+
+
+def build_attribution_preview(events, summary_events):
+    refs_by_turn = {}
+    child_turns = set()
+    for event in summary_events:
+        key = event_turn_key(event)
+        task = event.get("task") if isinstance(event.get("task"), dict) else {}
+        ref = task.get("work_item_ref")
+        if not key or task.get("match_state") != "assigned" or not isinstance(ref, str) or not ref:
+            continue
+        refs_by_turn.setdefault(key, set()).add(ref)
+        context = event.get("context") if isinstance(event.get("context"), dict) else {}
+        if context.get("parent_session_id"):
+            child_turns.add(key)
+
+    assignments = {key: next(iter(refs)) for key, refs in refs_by_turn.items() if len(refs) == 1}
+    totals = {}
+    for ref in sorted(set(assignments.values())):
+        totals[ref] = {
+            "work_item_ref": ref,
+            "turns": sum(assigned_ref == ref for assigned_ref in assignments.values()),
+            "token": {key: 0 for key in TOKEN_KEYS},
+            "wall_time_ms": 0,
+            "agent_time_ms": 0,
+        }
+
+    coverage = {
+        "summary_turns_assigned": len(assignments),
+        "summary_turn_conflicts": sum(len(refs) > 1 for refs in refs_by_turn.values()),
+        "token_events_total": 0,
+        "token_events_attributed": 0,
+        "terminal_duration_events_total": 0,
+        "terminal_duration_events_attributed": 0,
+    }
+    for event in events:
+        key = event_turn_key(event)
+        ref = assignments.get(key)
+        token = event.get("token") if isinstance(event.get("token"), dict) else None
+        if token is not None:
+            coverage["token_events_total"] += 1
+            if ref:
+                coverage["token_events_attributed"] += 1
+                for token_key in TOKEN_KEYS:
+                    value = token.get(token_key, 0)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        totals[ref]["token"][token_key] += value
+
+        if event.get("event_type") in {"task_complete", "turn_aborted"}:
+            coverage["terminal_duration_events_total"] += 1
+            task = event.get("task") if isinstance(event.get("task"), dict) else {}
+            duration = task.get("duration_ms")
+            if ref and isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration >= 0:
+                coverage["terminal_duration_events_attributed"] += 1
+                totals[ref]["agent_time_ms"] += duration
+                if key not in child_turns:
+                    totals[ref]["wall_time_ms"] += duration
+
+    return {"coverage": coverage, "requirements": list(totals.values())}
+
+
+def mark_summary_uploaded(queue_path, summary_ids):
+    if not summary_ids:
+        return
+    queue_path = pathlib.Path(queue_path).expanduser()
+    if not queue_path.exists():
+        raise RuntimeError(f"summary queue disappeared: {queue_path}")
+    with closing(sqlite3.connect(str(queue_path))) as connection:
+        connection.executemany(
+            "UPDATE turn_summary_queue SET uploaded = 1 WHERE summary_id = ? AND ready = 1 AND uploaded = 0",
+            ((summary_id,) for summary_id in summary_ids),
+        )
+        connection.commit()
 
 
 def chunked(items, size):
@@ -819,6 +1239,11 @@ def build_batch(endpoint_args, codex_home, tz_name, mid, events):
     }
 
 
+class RejectRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def post_json(endpoint, token, body, timeout):
     data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(
@@ -827,11 +1252,12 @@ def post_json(endpoint, token, body, timeout):
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "User-Agent": f"codex-usage-uploader-v2/{VERSION}",
+            "User-Agent": f"codex-usage-uploader-v3/{VERSION}",
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    opener = urllib.request.build_opener(RejectRedirect())
+    with opener.open(request, timeout=timeout) as response:
         response_body = response.read().decode("utf-8", errors="replace")
         if not response_body:
             return {}
@@ -841,6 +1267,30 @@ def post_json(endpoint, token, body, timeout):
             return {"raw_response_length": len(response_body)}
 
 
+def validate_upload_response(response, expected_count):
+    if not isinstance(response, dict):
+        raise RuntimeError("upload response must be a JSON object")
+    accepted = response.get("accepted")
+    duplicates = response.get("duplicates")
+    errors = response.get("errors")
+    if (
+        isinstance(accepted, bool)
+        or not isinstance(accepted, int)
+        or accepted < 0
+        or isinstance(duplicates, bool)
+        or not isinstance(duplicates, int)
+        or duplicates < 0
+        or not isinstance(errors, list)
+    ):
+        raise RuntimeError("upload response must contain non-negative accepted/duplicates and an errors list")
+    if errors:
+        raise RuntimeError(f"upload response contained {len(errors)} error(s)")
+    if accepted + duplicates != expected_count:
+        raise RuntimeError(
+            f"upload response accounted for {accepted + duplicates} of {expected_count} event(s)"
+        )
+
+
 def upload_events(args, codex_home, tz_name, mid, events):
     responses = []
     for batch_events in chunked(events, args.batch_size):
@@ -848,7 +1298,9 @@ def upload_events(args, codex_home, tz_name, mid, events):
         last_error = None
         for attempt in range(max(args.retries, 1)):
             try:
-                responses.append(post_json(args.endpoint, args.token, body, args.timeout))
+                response = post_json(args.endpoint, args.token, body, args.timeout)
+                validate_upload_response(response, len(batch_events))
+                responses.append(response)
                 last_error = None
                 break
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -868,26 +1320,57 @@ def main():
     since_dt = parse_datetime(args.since, tz) if args.since else None
     mid = machine_id(codex_home)
     state = load_state(state_file)
-    events, next_state, stats = collect_events(codex_home, state, tz, since_dt, args.source_name, mid)
+    events, next_state, stats, lineage_index = collect_events(
+        codex_home, state, tz, since_dt, args.source_name, mid
+    )
 
     if args.dry_run:
+        terminal_outcomes = terminal_summary_outcomes(events)
+        summary_events, _ = (
+            read_summary_events(args.summary_queue, terminal_outcomes, lineage_index)
+            if args.summary_mode == "local"
+            else ([], [])
+        )
+        summary_match_states = {}
+        for event in summary_events:
+            match_state = event.get("task", {}).get("match_state", "unknown")
+            summary_match_states[match_state] = summary_match_states.get(match_state, 0) + 1
         print(json.dumps({
             "dry_run": True,
             "source_name": args.source_name,
             "machine_id": mid,
             "codex_home": str(codex_home),
             "events_ready": len(events),
+            "summary_events_ready": len(summary_events),
+            "summary_match_states": summary_match_states,
+            "attribution_preview": build_attribution_preview(events, summary_events),
             "stats": stats,
             "sample_event": events[0] if events else None,
+            "sample_summary_event": summary_events[0] if summary_events else None,
+            "summary_events": summary_events,
         }, ensure_ascii=True, indent=2))
         return 0
 
     responses = upload_events(args, codex_home, args.timezone, mid, events) if events else []
+    if args.summary_mode == "local":
+        finalize_terminal_summaries(args.summary_queue, terminal_summary_outcomes(events))
     save_state(state_file, next_state)
+    summary_events, summary_ids = (
+        read_summary_events(args.summary_queue, lineage_index=lineage_index)
+        if args.summary_mode == "local"
+        else ([], [])
+    )
+    summary_responses = (
+        upload_events(args, codex_home, args.timezone, mid, summary_events) if summary_events else []
+    )
+    mark_summary_uploaded(args.summary_queue, summary_ids)
     print(json.dumps({
         "uploaded": len(events),
         "batches": len(responses),
         "responses": responses,
+        "summary_uploaded": len(summary_events),
+        "summary_batches": len(summary_responses),
+        "summary_responses": summary_responses,
         "state_file": str(state_file),
         "stats": stats,
     }, ensure_ascii=True, indent=2))

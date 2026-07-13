@@ -12,6 +12,9 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("codex_usage_uploader.py")
 SESSION_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+PARENT_SESSION_ID = "11111111-2222-3333-4444-555555555555"
+CHILD_SESSION_ID = "66666666-7777-8888-9999-000000000000"
+SUBAGENT_SESSION_ID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 
 
 def load_module():
@@ -26,13 +29,51 @@ def event(timestamp, outer_type, payload):
 
 
 def write_session(codex_home, events):
+    return write_session_with_id(codex_home, SESSION_ID, "10-00-00", events)
+
+
+def write_session_with_id(codex_home, session_id, time_part, events):
     session_dir = codex_home / "sessions" / "2026" / "05" / "06"
-    session_dir.mkdir(parents=True)
-    path = session_dir / f"rollout-2026-05-06T10-00-00-{SESSION_ID}.jsonl"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    path = session_dir / f"rollout-2026-05-06T{time_part}-{session_id}.jsonl"
     with path.open("w", encoding="utf-8") as handle:
         for item in events:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
     return path
+
+
+def session_meta(session_id, timestamp="2026-05-06T01:00:00.000Z", **extra):
+    payload = {
+        "id": session_id,
+        "cwd": "D:\\repo",
+        "originator": "codex_desktop",
+        "cli_version": "1.2.3",
+        "model_provider": "openai",
+    }
+    payload.update(extra)
+    return event(timestamp, "session_meta", payload)
+
+
+def token_count(timestamp, last_total, total_total):
+    return event(timestamp, "event_msg", {
+        "type": "token_count",
+        "info": {
+            "last_token_usage": {
+                "input_tokens": last_total,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "total_tokens": last_total,
+            },
+            "total_token_usage": {
+                "input_tokens": total_total,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "total_tokens": total_total,
+            },
+        },
+    })
 
 
 def sample_events():
@@ -44,7 +85,7 @@ def sample_events():
             "cli_version": "1.2.3",
             "model_provider": "openai",
             "git": {
-                "repository_url": "https://git.example.com/team/repo.git",
+                "repository_url": "https://alice:PAT_SECRET@git.example.com/team/repo.git?token=LEAK",
                 "commit_hash": "abc123",
                 "branch": "main",
             },
@@ -166,6 +207,10 @@ def collect_once(codex_home, state=None):
 
 
 def test_collects_token_and_metadata_without_private_content():
+    module = load_module()
+    assert module.sanitize_repository_url(
+        "git@git.example.com:team/repo.git?token=LEAK#fragment"
+    ) == "git.example.com:team/repo.git"
     with tempfile.TemporaryDirectory() as temp:
         codex_home = Path(temp)
         write_session(codex_home, sample_events())
@@ -179,6 +224,7 @@ def test_collects_token_and_metadata_without_private_content():
     assert "total_token_usage" not in json.dumps(token)
     assert token["context"]["model"] == "gpt-5.4"
     assert token["context"]["cwd"] == "D:\\repo"
+    assert token["context"]["git"]["repository_url"] == "https://git.example.com/team/repo.git"
     assert token["rate_limits"]["primary"]["used_percent"] == 12.5
 
     shell = next(item for item in events if item["event_type"] == "exec_command_end")
@@ -201,8 +247,14 @@ def test_collects_token_and_metadata_without_private_content():
         "TOOL_OUTPUT_SECRET",
         "USER_MESSAGE_SECRET",
         "DO_NOT_UPLOAD",
+        "PAT_SECRET",
+        "token=LEAK",
     ]:
         assert secret not in serialized
+
+    module = load_module()
+    assert module.first_program("API_TOKEN=secret python app.py") is None
+    assert module.first_program("$env:API_TOKEN = 'secret'; python app.py") is None
 
 
 def test_state_incremental_and_truncated_rescan_event_id_stability():
@@ -271,6 +323,62 @@ def test_legacy_state_reconstructs_token_snapshot_before_offset():
         collected, _, _ = collect_once(codex_home, legacy_state)
 
     assert [item for item in collected if item["event_type"] == "token_count"] == []
+
+
+def test_forked_child_does_not_upload_copied_parent_token_snapshots():
+    with tempfile.TemporaryDirectory() as temp:
+        codex_home = Path(temp)
+        parent_events = [
+            session_meta(PARENT_SESSION_ID),
+            token_count("2026-05-06T01:00:01.000Z", 100, 100),
+            token_count("2026-05-06T01:00:02.000Z", 50, 150),
+        ]
+        child_events = [
+            session_meta(
+                CHILD_SESSION_ID,
+                "2026-05-06T02:00:00.000Z",
+                forked_from_id=PARENT_SESSION_ID,
+            ),
+            *parent_events,
+            token_count("2026-05-06T02:00:01.000Z", 30, 180),
+        ]
+        write_session_with_id(codex_home, PARENT_SESSION_ID, "10-00-00", parent_events)
+        write_session_with_id(codex_home, CHILD_SESSION_ID, "11-00-00", child_events)
+
+        collected, _, _ = collect_once(codex_home)
+
+    token_events = [item for item in collected if item["event_type"] == "token_count"]
+    parent_tokens = [item["token"]["total_tokens"] for item in token_events if item["session_id"] == PARENT_SESSION_ID]
+    child_tokens = [item["token"]["total_tokens"] for item in token_events if item["session_id"] == CHILD_SESSION_ID]
+    assert parent_tokens == [100, 50]
+    assert child_tokens == [30]
+
+
+def test_subagent_child_does_not_upload_parent_thread_token_snapshots():
+    with tempfile.TemporaryDirectory() as temp:
+        codex_home = Path(temp)
+        parent_events = [
+            session_meta(PARENT_SESSION_ID),
+            token_count("2026-05-06T01:00:01.000Z", 80, 80),
+        ]
+        subagent_events = [
+            session_meta(
+                SUBAGENT_SESSION_ID,
+                "2026-05-06T02:00:00.000Z",
+                parent_thread_id=PARENT_SESSION_ID,
+                thread_source="subagent",
+            ),
+            *parent_events,
+            token_count("2026-05-06T02:00:01.000Z", 25, 105),
+        ]
+        write_session_with_id(codex_home, PARENT_SESSION_ID, "10-00-00", parent_events)
+        write_session_with_id(codex_home, SUBAGENT_SESSION_ID, "11-00-00", subagent_events)
+
+        collected, _, _ = collect_once(codex_home)
+
+    token_events = [item for item in collected if item["event_type"] == "token_count"]
+    subagent_tokens = [item["token"]["total_tokens"] for item in token_events if item["session_id"] == SUBAGENT_SESSION_ID]
+    assert subagent_tokens == [25]
 
 
 def test_dry_run_cli_does_not_require_token():
@@ -368,6 +476,8 @@ if __name__ == "__main__":
     test_state_incremental_and_truncated_rescan_event_id_stability()
     test_repeated_token_snapshot_is_not_uploaded_twice()
     test_legacy_state_reconstructs_token_snapshot_before_offset()
+    test_forked_child_does_not_upload_copied_parent_token_snapshots()
+    test_subagent_child_does_not_upload_parent_thread_token_snapshots()
     test_dry_run_cli_does_not_require_token()
     test_http_upload_uses_bearer_header_and_retries()
     print("tests passed")
