@@ -283,6 +283,40 @@ def test_state_incremental_and_truncated_rescan_event_id_stability():
         assert replayed_token_id == original_token_id
 
 
+def test_partial_trailing_jsonl_line_is_retried():
+    with tempfile.TemporaryDirectory() as temp:
+        codex_home = Path(temp)
+        path = write_session(codex_home, sample_events()[:2])
+        complete_size = path.stat().st_size
+        token_json = json.dumps(sample_events()[2], ensure_ascii=False).encode("utf-8")
+        split = len(token_json) // 2
+        with path.open("ab") as handle:
+            handle.write(token_json[:split])
+
+        first_events, state, _ = collect_once(codex_home)
+        record = state["files"][str(path)]
+        assert record["offset"] == complete_size
+        assert not [item for item in first_events if item["event_type"] == "token_count"]
+
+        with path.open("ab") as handle:
+            handle.write(token_json[split:])
+        complete_but_unterminated_events, state, _ = collect_once(codex_home, state)
+        assert state["files"][str(path)]["offset"] == complete_size
+        assert complete_but_unterminated_events == []
+
+        next_line = (json.dumps(sample_events()[3], ensure_ascii=False) + "\n").encode("utf-8")
+        with path.open("ab") as handle:
+            handle.write(b"\n" + next_line)
+        completed_events, next_state, _ = collect_once(codex_home, state)
+        fresh_events, _, _ = collect_once(codex_home)
+
+    tokens = [item for item in completed_events if item["event_type"] == "token_count"]
+    assert [item["token"]["total_tokens"] for item in tokens] == [120]
+    expected_ids = [item["event_id"] for item in fresh_events[2:4]]
+    assert [item["event_id"] for item in completed_events] == expected_ids
+    assert next_state["files"][str(path)]["offset"] == complete_size + len(token_json) + 1 + len(next_line)
+
+
 def test_repeated_token_snapshot_is_not_uploaded_twice():
     with tempfile.TemporaryDirectory() as temp:
         codex_home = Path(temp)
@@ -482,6 +516,7 @@ def test_http_upload_uses_bearer_header_and_retries():
 if __name__ == "__main__":
     test_collects_token_and_metadata_without_private_content()
     test_state_incremental_and_truncated_rescan_event_id_stability()
+    test_partial_trailing_jsonl_line_is_retried()
     test_repeated_token_snapshot_is_not_uploaded_twice()
     test_legacy_state_reconstructs_token_snapshot_before_offset()
     test_forked_child_does_not_upload_copied_parent_token_snapshots()

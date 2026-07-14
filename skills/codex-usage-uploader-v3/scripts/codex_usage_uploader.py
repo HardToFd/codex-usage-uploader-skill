@@ -873,13 +873,18 @@ def read_file_events(
         if offset:
             handle.seek(offset)
         for raw_line in handle:
-            current_offset += len(raw_line)
-            line_no += 1
+            if not raw_line.endswith(b"\n"):
+                break
+            next_offset = current_offset + len(raw_line)
             line = raw_line.decode("utf-8", errors="replace")
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
+                current_offset = next_offset
+                line_no += 1
                 continue
+            current_offset = next_offset
+            line_no += 1
             payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
             type_name = event_type(obj)
             if type_name:
